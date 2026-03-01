@@ -1,0 +1,2 @@
+# Test_Rag
+Embedding_Model_sBert+Vector_Database_FAISS+OpenAI_API
