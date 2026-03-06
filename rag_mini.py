@@ -2,7 +2,7 @@
 RAG System - Minimal Version
 """
 
-from os import getenv
+from os import getenv, path
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
@@ -13,10 +13,13 @@ from openai import OpenAI
 # ===========================================
 # CONFIG - ĐẶT API KEY VÀ PATH VÀO ĐÂY
 # ===========================================
-FILE_PATH: str = "Data Câu.xlsx"
+FILE_PATH: str = "datadata.xlsx"
 EMBEDDING_MODEL: str = "keepitreal/vietnamese-sbert"
+INDEX_FILE: str = "vector.index"
 LLM_MODEL: str = "gpt-4o-mini"
-TOP_K: int = 1
+TOP_K: int = 5
+CHAT_MEMORY_SIZE: int = 5
+CHAT_MEMORY: list[dict] = [] # Lưu lịch sử hội thoại (nếu muốn)
 
 
 # ===========================================
@@ -52,14 +55,29 @@ def load_data(file_path: str) -> pd.DataFrame:
 
 def build_index(df: pd.DataFrame) -> faiss.Index:
     """Build FAISS vector database"""
+    ## Nếu đã tồn tại file index thì không cần tạo lại
+    if path.exists(INDEX_FILE):
+        index: faiss.Index = faiss.read_index(INDEX_FILE)
+        # Nếu file index tồn tại nhưng không có vector nào thì cũng cần tạo lại index
+        if index.ntotal == 0:
+            print("Index file exists but is empty -> Rebuilding index...")
+        # Check timestamp (thời gian sửa đổi file lần cuối) để xem có cần cập nhật lại file index ko
+        elif  path.getmtime(FILE_PATH) > path.getmtime(INDEX_FILE):
+            print("Data has changed -> Rebuiding index...")
+        else: 
+            print("Loading existing index...")
+            return index
+
+    ## Build index from scratch
     print("Building index...")
-    documents: list[str] = df['document'].tolist() # pd.Index -> list 
+    documents: list[str] = df['document'].tolist() # pd.Series -> python list
+    # documents: np.ndarray = df['document'].values # pd.Series -> numpy ndarray
     """
     ["A", "B", "C"] -> 
-                            [
-                        [0.1, 0.2, ..., 0.8],
-                        [0.4, 0.1, ..., 0.9],
-                        [0.3, 0.7, ..., 0.2]
+                        [
+                            [0.1, 0.2, ..., 0.8],
+                            [0.4, 0.1, ..., 0.9],
+                            [0.3, 0.7, ..., 0.2]
                         ]
     shape = (3, 768)
     """
@@ -70,65 +88,115 @@ def build_index(df: pd.DataFrame) -> faiss.Index:
     ) # Text -- embed --> vector
     embeddings = embeddings.astype('float32')
     
-    # Tạo index database 768 dimension
-    index: faiss.Index = faiss.IndexFlatL2(embeddings.shape[1]) # .IndexFlatL2 tính khoảng cách Euclid 
-    #* faiss.normalize_L2(embeddings) : 
-    #* Một vector khi được chuẩn hóa L2 nghĩa là ta chia toàn bộ các giá trị cho độ dài của chính nó. Sau chuẩn hóa, vector luôn có độ dài bằng 1. 
-    #* IndexFlatIP Nếu dùng cosine similarity 
+    # Tạo index database rỗng có 768 dimension (model=vietnamese-sbert)
+    # embeddings.shape = (xxx: số câu trong corpus, 768: số chiều của 1 vector)
+    index = faiss.IndexFlatL2(embeddings.shape[1]) # .IndexFlatL2 tính khoảng cách Euclid 
+    # faiss.normalize_L2(embeddings) : 
+    # Một vector khi được chuẩn hóa L2 nghĩa là ta chia toàn bộ các giá trị cho độ dài của chính nó. Sau chuẩn hóa, vector luôn có độ dài bằng 1. 
+    # IndexFlatIP Nếu dùng cosine similarity 
     print(type(embeddings))
     print(embeddings.dtype)
     print(embeddings.shape)
+
     # Lưu vector vào bộ nhớ
     index.add(embeddings) # type: ignore
+    # Lưu FAISS Index ra file index
+    faiss.write_index(index, INDEX_FILE)
     
-    print(f"Index built: {index.ntotal} vectors")
+    print(f"Index built: {index.ntotal} vectors. Index saved to disk.")
     return index
 
+def _build_query_with_history(query: str, chat_history: list[dict[str, str]]) -> str:
+    ## Nếu không có lịch sử hội thoại thì trả về query gốc
+    if not chat_history:
+        return query
 
-def ask(query, df, index) -> str | None:
+    ## Nếu query quá ngắn thì mới cần history để tránh mất ngữ cảnh,
+    #  còn nếu query đã đủ dài thì không cần thiết phải thêm lịch sử vào
+    if len(query.split()) <= 4:
+        last_question = chat_history[-1]["question"]
+        return f"{last_question}\n{query}"
+
+    return query
+    
+
+def ask(query: str, df: pd.DataFrame, index: faiss.Index, chat_history: list[dict[str, str]]) -> str | None:
     """Ask a question"""
-    # Encode query
-    query_vector = embedding_model.encode([query]).astype('float32')
+    ## Build query with history
+    retrieval_query: str = _build_query_with_history(query, chat_history)
+
+    ## Encode query -> Thêm query vector này vào index
+    query_vector: np.ndarray = embedding_model.encode([retrieval_query]).astype('float32')
     
-    # Search
-    distances, indices = index.search(query_vector, TOP_K)
+    # Search, tìm semantic similarity
+    # .search(n_query: query vectors, k: top results)
+    # distances: khoảng cách giữa query vector và các vector trong index (càng nhỏ càng giống)
+    # indices: index của các vector trong index được tìm thấy (càng nhỏ càng giống)
+    distances, indices = index.search(query_vector, TOP_K) # type: ignore
+    # precheck 
+    # print(f"Distances: {distances}, Indices: {indices}")
     
-    # Retrieve docs
-    docs = [df.iloc[i]['document'] for i in indices[0]]
-    context = "\n\n".join(docs)
+    ## Retrieve docs
+    # docs = df.at[i, 'document'] # df.at[row_index, column_name]
+    # indices[0] là mảng chứa index của các document được tìm thấy,
+    # df.iloc[i]['document'] là cách lấy document từ dataframe dựa trên index i
+    docs: list[str] = [df.iloc[i]['document'] for i in indices[0] if i != -1] # loại bỏ index = -1 (không tìm thấy vector nào)
+     
+    context: str = "\n\n".join(docs)
+    # precheck
+    # print(f"Context: {context}")
     context = context[:1500]
+
+    ## Prompt & generate answer
+    prompt: str = f"""
+        Dựa vào thông tin sau:
+
+        Thông tin tham khảo:
+        {context}
+
+        Trả lời câu hỏi:
+        {query}
+
+        Chỉ trả lời dựa trên thông tin được cung cấp. Nếu không có thông tin, nói rõ là không biết.
+        """
     
-    # Generate answer
-    prompt: str = f"""Dựa vào thông tin sau:
+    # precheck
+    print(f"Prompt: {prompt}")
 
-{context}
-
-Trả lời câu hỏi: {query}
-
-Chỉ trả lời dựa trên thông tin được cung cấp. Nếu không có thông tin, nói rõ là không biết."""
-    
     response = openai_client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=150
     )
-    # In token đã dùng
+
+    ## In token đã dùng
     print("Token usage:", response.usage)
-    return response.choices[0].message.content
+    content: str | None = response.choices[0].message.content
+    if content is None:
+        raise ValueError("LLM ko tạo content nào")
+    answer = content
+
+    ## Lưu lịch sử hội thoại
+    chat_history.append({"question": query})
+    print(f"\nChat history: {chat_history}")
+    if len(chat_history) > CHAT_MEMORY_SIZE:
+        chat_history.pop(0) # loại bỏ câu hỏi cũ nhất nếu vượt quá kích thước bộ nhớ
+
+    return answer
 
 
 # ===========================================
 # MAIN
 # ===========================================
 def main() -> None:
-    # Load and build
+    ## Load and build
     df: pd.DataFrame = load_data(FILE_PATH)
     index: faiss.Index = build_index(df)
     
     print("\nReady. Type 'exit' to quit.\n")
     
-    # Main loop
+    ## Main loop
     while True:
         query: str = input("Question: ").strip()
         
@@ -139,7 +207,7 @@ def main() -> None:
             continue
         
         try:
-            answer = ask(query, df, index)
+            answer = ask(query, df, index, CHAT_MEMORY)
             print(f"\nAnswer:\n{answer}\n")
         except Exception as e:
             print(f"Error: {e}\n")
